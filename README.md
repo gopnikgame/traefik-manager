@@ -1,8 +1,8 @@
 # Traefik Manager
 
-![Version](https://img.shields.io/badge/Traefik_Manager-v1.3.0-blue) ![Docker](https://img.shields.io/badge/Docker-Ready-brightgreen) ![Kubernetes](https://img.shields.io/badge/Kubernetes-Ready-brightgreen)
+![Version](https://img.shields.io/badge/Traefik_Manager-v1.4.0-blue) ![Docker](https://img.shields.io/badge/Docker-Ready-brightgreen) ![Kubernetes](https://img.shields.io/badge/Kubernetes-Ready-brightgreen) ![Native](https://img.shields.io/badge/Native-Ready-brightgreen)
 
-**Интерактивный скрипт для управления Traefik в средах Docker и Kubernetes.**  
+**Интерактивный скрипт для управления Traefik в средах Docker, Kubernetes и нативной установке.**  
 Traefik Manager позволяет легко настраивать, управлять и мониторить Traefik без необходимости знания сложных команд.
 
 ---
@@ -11,11 +11,13 @@ Traefik Manager позволяет легко настраивать, управлять и мониторить Traefik без 
 
 - **Управление Docker**: работа с лейблами контейнеров для настройки маршрутизации.
 - **Управление Kubernetes**: создание и редактирование IngressRoute.
+- **Управление статическими конфигурациями**: создание и редактирование файлов конфигурации.
+- **Нативная установка**: возможность работы без Docker и Kubernetes.
 - **Автоматизированная установка**: поддержка установки зависимостей.
 - **Резервное копирование**: создание и управление резервными копиями конфигураций.
 - **Мониторинг**: просмотр метрик и состояния Traefik.
 - **Проверка безопасности**: анализ конфигураций на предмет уязвимостей.
-- **Динамическое включение/отключение поддержки Kubernetes.**
+- **Динамическое включение/отключение поддержки Kubernetes и Docker.**
 
 ---
 
@@ -23,14 +25,16 @@ Traefik Manager позволяет легко настраивать, управлять и мониторить Traefik без 
 
 - Docker
 - Kubernetes (включая minikube и kind)
+- Нативная установка (без контейнеризации)
 - Различные дистрибутивы Linux (Ubuntu, Debian, CentOS)
 
 ---
 
 ## Требования
 
-- **Docker** (устанавливается автоматически при необходимости)
 - **jq** (устанавливается автоматически при необходимости)
+- Для функций Docker:
+  - **Docker** (устанавливается автоматически при необходимости)
 - Для функций Kubernetes:
   - **kubectl** (устанавливается автоматически при необходимости)
   - **minikube** или **kind** (устанавливается автоматически при необходимости)
@@ -42,6 +46,7 @@ Traefik Manager позволяет легко настраивать, управлять и мониторить Traefik без 
 ```bash
 curl -s https://raw.githubusercontent.com/gopnikgame/traefik-manager/main/traefik-manager.sh -o /tmp/traefik-manager.sh && sudo bash /tmp/traefik-manager.sh
 ```
+
 ---
 
 ## Основные функции
@@ -58,6 +63,11 @@ curl -s https://raw.githubusercontent.com/gopnikgame/traefik-manager/main/traefi
 - Редактирование и удаление IngressRoute.
 - Автоматическая установка и настройка minikube.
 
+### Управление статическими конфигурациями
+- Создание новых конфигурационных файлов.
+- Редактирование существующих конфигураций.
+- Применение конфигурации с автоматическим перезапуском Traefik.
+
 ### Мониторинг и безопасность
 - Проверка конфигурации Traefik.
 - Анализ безопасности и рекомендации.
@@ -65,15 +75,32 @@ curl -s https://raw.githubusercontent.com/gopnikgame/traefik-manager/main/traefi
 
 ---
 
+## Режимы установки
+
+Скрипт поддерживает три режима установки Traefik:
+- **Docker**: установка и управление Traefik в контейнере Docker
+- **Kubernetes**: установка через Helm в кластер Kubernetes
+- **Нативный режим**: установка напрямую в систему без контейнеризации
+
+---
+
 ## Использование
 
 После запуска скрипта выберите нужную функцию из интерактивного меню:
 
-1. Управление Docker-контейнерами (лейблы)
+1. Управление Docker-контейнерами (лейблы) - доступно если Docker включен
 2. Управление Kubernetes (IngressRoute) - доступно если Kubernetes включен
-3. Редактирование конфигураций
-4. Перезапуск Traefik
-5. Проверка конфигурации и многое другое
+3. Редактирование основного конфига (traefik.yml)
+4. Редактирование динамических конфигов (в conf.d/)
+5. Управление статическими конфигурациями
+6. Перезапуск Traefik
+7. Проверка конфигурации
+8. Создание резервной копии конфигураций
+9. Мониторинг Traefik
+10. Проверка безопасности
+11. Установка Traefik (Docker/Kubernetes/Нативно)
+12. Включение/отключение поддержки Kubernetes
+13. Включение/отключение поддержки Docker
 
 ---
 
