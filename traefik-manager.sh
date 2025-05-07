@@ -5,13 +5,16 @@ CONFIG_DIR="/etc/traefik"
 DYNAMIC_CONFIG_DIR="$CONFIG_DIR/conf.d"
 TRAEFIK_CONTAINER_NAME="traefik"
 TRAEFIK_NAMESPACE="traefik"  # Для Kubernetes
-REQUIRED_PACKAGES=("jq" "docker")  # Базовые обязательные пакеты
-K8S_PACKAGES=("kubectl")      # Пакеты для Kubernetes
+REQUIRED_PACKAGES=("jq")  # Базовые обязательные пакеты (Docker удален из обязательных)
+DOCKER_PACKAGES=("docker") # Пакеты для Docker
+K8S_PACKAGES=("kubectl")   # Пакеты для Kubernetes
 LOG_FILE="/var/log/traefik-manager.log"
 BACKUP_DIR="/opt/traefik-backups"
-VERSION="1.3.0"
+VERSION="1.4.0"
 TEMP_FILES=() # Для отслеживания временных файлов
 K8S_ENABLED=false # Флаг наличия Kubernetes
+DOCKER_ENABLED=false # Флаг наличия Docker
+NATIVE_MODE=false # Флаг запуска без Docker и Kubernetes (нативный режим)
 
 # Цвета для вывода
 RED='\033[0;31m'
@@ -55,6 +58,44 @@ check_memory() {
         return 1  # Недостаточно памяти
     else
         return 0  # Достаточно памяти
+    fi
+}
+
+# Проверка наличия Docker
+check_docker() {
+    log "INFO" "Проверка наличия Docker"
+    echo -e "${BLUE}Проверка наличия Docker...${NC}"
+    
+    if command -v docker &> /dev/null; then
+        if docker info &> /dev/null; then
+            log "INFO" "Docker найден и запущен"
+            echo -e "${GREEN}Docker найден и запущен.${NC}"
+            DOCKER_ENABLED=true
+            return 0
+        else
+            log "WARNING" "Docker найден, но демон не запущен"
+            echo -e "${YELLOW}Docker найден, но демон не запущен.${NC}"
+            read -p "Запустить Docker? (y/n): " start_docker
+            if [ "$start_docker" = "y" ]; then
+                sudo systemctl start docker
+                if [ $? -eq 0 ]; then
+                    log "INFO" "Docker успешно запущен"
+                    echo -e "${GREEN}Docker успешно запущен.${NC}"
+                    DOCKER_ENABLED=true
+                    return 0
+                else
+                    log "ERROR" "Не удалось запустить Docker"
+                    echo -e "${RED}Не удалось запустить Docker.${NC}"
+                    return 1
+                fi
+            else
+                log "INFO" "Пользователь отказался запускать Docker"
+                echo -e "${YELLOW}Docker не будет использоваться.${NC}"
+                return 1
+            fi
+        fi
+    else
+        return 1
     fi
 }
 
@@ -267,17 +308,6 @@ install_dependencies() {
                             exit 1
                         }
                         ;;
-                    "docker")
-                        log "INFO" "Установка Docker"
-                        echo -e "${GREEN}Устанавливаю Docker...${NC}"
-                        curl -fsSL https://get.docker.com | sh || {
-                            log "ERROR" "Ошибка установки Docker"
-                            echo -e "${RED}Ошибка установки Docker!${NC}"
-                            exit 1
-                        }
-                        sudo usermod -aG docker "$USER"
-                        log "INFO" "Пользователь $USER добавлен в группу docker"
-                        ;;
                 esac
                 log "INFO" "$pkg успешно установлен"
                 echo -e "${GREEN}$pkg успешно установлен.${NC}"
@@ -290,6 +320,35 @@ install_dependencies() {
             echo -e "${GREEN}$pkg установлен.${NC}"
         fi
     done
+    
+    # Проверка наличия Docker
+    if ! check_docker; then
+        log "WARNING" "Docker не найден или не запущен"
+        echo -e "${YELLOW}Docker не найден или не запущен.${NC}"
+        
+        read -p "Установить Docker? (y/n): " docker_answer
+        if [ "$docker_answer" = "y" ]; then
+            echo -e "${GREEN}Устанавливаю Docker...${NC}"
+            curl -fsSL https://get.docker.com | sh || {
+                log "ERROR" "Ошибка установки Docker"
+                echo -e "${RED}Ошибка установки Docker!${NC}"
+            }
+            
+            if [ $? -eq 0 ]; then
+                sudo usermod -aG docker "$USER"
+                log "INFO" "Пользователь $USER добавлен в группу docker"
+                DOCKER_ENABLED=true
+                echo -e "${GREEN}Docker успешно установлен.${NC}"
+                echo -e "${YELLOW}Примечание: Возможно потребуется перелогиниться для использования Docker без sudo.${NC}"
+            fi
+        else
+            log "INFO" "Пользователь отказался от установки Docker"
+            echo -e "${YELLOW}Docker не будет использоваться.${NC}"
+            DOCKER_ENABLED=false
+        fi
+    else
+        DOCKER_ENABLED=true
+    fi
     
     # Проверка наличия Kubernetes
     if ! check_kubernetes; then
@@ -361,6 +420,14 @@ install_dependencies() {
                 K8S_ENABLED=false
             fi
         fi
+    fi
+    
+    # Если ни Docker, ни Kubernetes не включены, предлагаем установить Traefik нативно
+    if [ "$DOCKER_ENABLED" = false ] && [ "$K8S_ENABLED" = false ]; then
+        log "INFO" "Ни Docker, ни Kubernetes не включены"
+        echo -e "${YELLOW}Ни Docker, ни Kubernetes не включены.${NC}"
+        echo -e "${YELLOW}Рекомендуется использовать нативную установку Traefik.${NC}"
+        NATIVE_MODE=true
     fi
 }
 
@@ -540,6 +607,101 @@ manage_docker_labels() {
     esac
 }
 
+# Управление статическими конфигурациями Traefik
+manage_static_config() {
+    log "INFO" "Запуск управления статическими конфигурациями"
+    
+    echo -e "${BLUE}Управление статическими конфигурациями Traefik${NC}"
+    
+    echo -e "
+    ${YELLOW}1) Создать новый статический конфиг
+    2) Редактировать существующий конфиг
+    3) Применить конфиг
+    4) Вернуться в меню${NC}
+    "
+    read -p "Выберите действие: " action
+
+    case $action in
+        1)
+            log "INFO" "Создание нового статического конфига"
+            read -p "Введите имя конфига (например, routes.yml): " config_name
+            
+            # Создание директории, если не существует
+            mkdir -p "$DYNAMIC_CONFIG_DIR"
+            
+            # Создание шаблона конфига
+            local temp_file=$(mktemp)
+            TEMP_FILES+=("$temp_file")
+            
+            cat <<EOF > "$temp_file"
+# Пример статического конфига Traefik
+
+http:
+  routers:
+    my-service:
+      rule: "Host(\`example.com\`)"
+      service: "my-service"
+      
+  services:
+    my-service:
+      loadBalancer:
+        servers:
+          - url: "http://192.168.1.100:80"
+
+# Документация: https://doc.traefik.io/traefik/routing/providers/file/
+EOF
+
+            # Редактирование и сохранение
+            nano "$temp_file"
+            sudo cp "$temp_file" "$DYNAMIC_CONFIG_DIR/$config_name"
+            
+            if [ $? -eq 0 ]; then
+                log "INFO" "Создан новый статический конфиг: $config_name"
+                echo -e "${GREEN}Создан новый конфиг: $DYNAMIC_CONFIG_DIR/$config_name${NC}"
+            else
+                log "ERROR" "Ошибка при создании конфига"
+                echo -e "${RED}Ошибка при создании конфига!${NC}"
+            fi
+            ;;
+        2)
+            log "INFO" "Редактирование статического конфига"
+            echo -e "${GREEN}Доступные конфиги:${NC}"
+            ls -l "$DYNAMIC_CONFIG_DIR"/*.yml "$DYNAMIC_CONFIG_DIR"/*.yaml 2>/dev/null || echo "Нет файлов конфигурации."
+            
+            read -p "Введите имя файла для редактирования: " config_name
+            if [ -f "$DYNAMIC_CONFIG_DIR/$config_name" ]; then
+                sudo nano "$DYNAMIC_CONFIG_DIR/$config_name"
+                log "INFO" "Отредактирован конфиг: $config_name"
+                echo -e "${GREEN}Конфиг обновлен.${NC}"
+            else
+                log "ERROR" "Файл не найден: $DYNAMIC_CONFIG_DIR/$config_name"
+                echo -e "${RED}Файл не найден!${NC}"
+            fi
+            ;;
+        3)
+            log "INFO" "Применение конфигурации"
+            # Перезапуск Traefik
+            if systemctl is-active --quiet traefik; then
+                sudo systemctl reload traefik 2>/dev/null || sudo systemctl restart traefik
+                log "INFO" "Traefik перезапущен"
+                echo -e "${GREEN}Конфигурация применена. Traefik перезапущен.${NC}"
+            elif docker ps --format '{{.Names}}' | grep -q "$TRAEFIK_CONTAINER_NAME"; then
+                docker restart "$TRAEFIK_CONTAINER_NAME"
+                log "INFO" "Traefik контейнер перезапущен"
+                echo -e "${GREEN}Traefik контейнер перезапущен.${NC}"
+            else
+                log "WARNING" "Traefik не запущен как системный сервис или контейнер"
+                echo -e "${YELLOW}Traefik не запущен как системный сервис или контейнер${NC}"
+                echo -e "${YELLOW}Конфигурация будет применена при следующем запуске Traefik.${NC}"
+            fi
+            ;;
+        4) 
+            log "INFO" "Возврат в главное меню из управления статическими конфигурациями"
+            return ;;
+        *) echo -e "${RED}Неверный вариант!${NC}" ;;
+    esac
+}
+
 # Создание резервной копии Traefik конфигураций
 backup_config() {
     log "INFO" "Запуск создания резервной копии"
@@ -582,7 +744,26 @@ monitor_traefik() {
     log "INFO" "Запуск мониторинга Traefik"
     echo -e "${BLUE}Проверка состояния Traefik...${NC}"
     
-    if docker ps --format '{{.Names}}' | grep -q "$TRAEFIK_CONTAINER_NAME"; then
+    if [ "$NATIVE_MODE" = true ] && systemctl is-active --quiet traefik; then
+        log "INFO" "Traefik запущен как системный сервис"
+        echo -e "${GREEN}Traefik запущен как системный сервис${NC}"
+        echo -e "${YELLOW}Статистика процесса:${NC}"
+        ps aux | grep traefik | grep -v grep
+        
+        # Проверяем наличие метрик
+        read -p "Проверить метрики Traefik? (y/n): " metrics_answer
+        if [ "$metrics_answer" = "y" ]; then
+            read -p "Укажите адрес метрик (по умолчанию: http://localhost:8080/metrics): " metrics_url
+            metrics_url=${metrics_url:-"http://localhost:8080/metrics"}
+            log "INFO" "Проверка метрик: $metrics_url"
+            
+            if command -v curl &> /dev/null; then
+                curl -s "$metrics_url" | head -n 20
+            else
+                echo -e "${YELLOW}Curl не установлен, невозможно проверить метрики${NC}"
+            fi
+        fi
+    elif [ "$DOCKER_ENABLED" = true ] && docker ps --format '{{.Names}}' | grep -q "$TRAEFIK_CONTAINER_NAME"; then
         log "INFO" "Traefik запущен в Docker"
         echo -e "${GREEN}Traefik запущен в Docker${NC}"
         echo -e "${YELLOW}Статистика контейнера:${NC}"
@@ -601,7 +782,7 @@ monitor_traefik() {
                 echo -e "${YELLOW}Curl не установлен, невозможно проверить метрики${NC}"
             fi
         fi
-    elif kubectl get pods -n "$TRAEFIK_NAMESPACE" 2>/dev/null | grep -q "traefik"; then
+    elif [ "$K8S_ENABLED" = true ] && kubectl get pods -n "$TRAEFIK_NAMESPACE" 2>/dev/null | grep -q "traefik"; then
         log "INFO" "Traefik запущен в Kubernetes"
         echo -e "${GREEN}Traefik запущен в Kubernetes${NC}"
         kubectl get pods -n "$TRAEFIK_NAMESPACE"
@@ -620,8 +801,8 @@ monitor_traefik() {
             kubectl logs -l app.kubernetes.io/name=traefik -n "$TRAEFIK_NAMESPACE" --tail=50
         fi
     else
-        log "WARNING" "Traefik не найден ни в Docker, ни в Kubernetes"
-        echo -e "${RED}Traefik не найден ни в Docker, ни в Kubernetes!${NC}"
+        log "WARNING" "Traefik не найден ни в Docker, ни в Kubernetes, ни как системный сервис"
+        echo -e "${RED}Traefik не найден ни в Docker, ни в Kubernetes, ни как системный сервис!${NC}"
     fi
 }
 
@@ -662,12 +843,21 @@ check_security() {
     fi
     
     # Проверка на работу под root в Docker
-    if docker ps --format '{{.Names}}' | grep -q "$TRAEFIK_CONTAINER_NAME"; then
+    if [ "$DOCKER_ENABLED" = true ] && docker ps --format '{{.Names}}' | grep -q "$TRAEFIK_CONTAINER_NAME"; then
         if docker inspect "$TRAEFIK_CONTAINER_NAME" --format '{{.Config.User}}' | grep -q "^$" || \
            docker inspect "$TRAEFIK_CONTAINER_NAME" --format '{{.Config.User}}' | grep -q "^0$" || \
            docker inspect "$TRAEFIK_CONTAINER_NAME" --format '{{.Config.User}}' | grep -q "^root$"; then
             log "WARNING" "Traefik работает в Docker под root пользователем"
             echo -e "${YELLOW}Traefik работает в Docker под root пользователем. Рекомендуется использовать непривилегированного пользователя${NC}"
+            security_issues=$((security_issues+1))
+        fi
+    fi
+    
+    # Проверка на работу под root в нативном режиме
+    if [ "$NATIVE_MODE" = true ] && systemctl is-active --quiet traefik; then
+        if [ "$(ps -o user= -p $(pgrep -f "traefik"))" = "root" ]; then
+            log "WARNING" "Traefik работает под root пользователем"
+            echo -e "${YELLOW}Traefik работает под root пользователем. Рекомендуется использовать непривилегированного пользователя${NC}"
             security_issues=$((security_issues+1))
         fi
     fi
@@ -766,6 +956,8 @@ EOF
         # Создаем файл для Let's Encrypt сертификатов с правильными правами
         sudo touch "$CONFIG_DIR/acme.json"
         sudo chmod 600 "$CONFIG_DIR/acme.json"
+        DOCKER_ENABLED=true
+        NATIVE_MODE=false
     else
         log "ERROR" "Ошибка при запуске Traefik контейнера"
         echo -e "${RED}Ошибка при запуске Traefik контейнера!${NC}"
@@ -852,9 +1044,133 @@ EOF
         echo -e "${GREEN}Traefik успешно установлен в Kubernetes.${NC}"
         echo -e "Для доступа к панели управления выполните:"
         echo -e "kubectl port-forward -n $TRAEFIK_NAMESPACE \$(kubectl get pods -n $TRAEFIK_NAMESPACE -l app.kubernetes.io/name=traefik -o name) 9000:9000"
+        K8S_ENABLED=true
+        NATIVE_MODE=false
     else
         log "ERROR" "Ошибка при установке Traefik в Kubernetes"
         echo -e "${RED}Ошибка при установке Traefik в Kubernetes!${NC}"
+    fi
+}
+
+# Установка Traefik без Docker (нативно)
+install_traefik_native() {
+    log "INFO" "Запуск установки Traefik без Docker"
+    echo -e "${BLUE}Установка Traefik без Docker (нативная)...${NC}"
+    
+    # Создание необходимых директорий
+    sudo mkdir -p "$CONFIG_DIR" "$DYNAMIC_CONFIG_DIR"
+    
+    # Определение архитектуры
+    ARCH=$(uname -m)
+    case $ARCH in
+        x86_64) ARCH_FLAG="amd64" ;;
+        aarch64) ARCH_FLAG="arm64" ;;
+        *) ARCH_FLAG="amd64" ;;
+    esac
+    
+    # Получение последней версии Traefik
+    TRAEFIK_VERSION=$(curl -s https://api.github.com/repos/traefik/traefik/releases/latest | grep -oP '"tag_name": "\K(.*)(?=")')
+    TRAEFIK_VERSION=${TRAEFIK_VERSION#v}  # Удаляем префикс "v"
+    log "INFO" "Будет установлена версия Traefik: $TRAEFIK_VERSION"
+    echo -e "${BLUE}Установка Traefik версии $TRAEFIK_VERSION...${NC}"
+    
+    # Загрузка и установка
+    local temp_dir=$(mktemp -d)
+    TEMP_FILES+=("$temp_dir")
+    
+    curl -L "https://github.com/traefik/traefik/releases/download/v${TRAEFIK_VERSION}/traefik_v${TRAEFIK_VERSION}_linux_${ARCH_FLAG}.tar.gz" -o "$temp_dir/traefik.tar.gz"
+    tar -xzf "$temp_dir/traefik.tar.gz" -C "$temp_dir"
+    sudo mv "$temp_dir/traefik" /usr/local/bin/
+    sudo chmod +x /usr/local/bin/traefik
+    
+    if [ ! -f /usr/local/bin/traefik ]; then
+        log "ERROR" "Ошибка установки Traefik"
+        echo -e "${RED}Ошибка установки Traefik!${NC}"
+        return 1
+    fi
+    
+    # Создание базового конфига
+    local config_file="$CONFIG_DIR/traefik.yml"
+    local temp_config=$(mktemp)
+    TEMP_FILES+=("$temp_config")
+    
+    cat <<EOF > "$temp_config"
+global:
+  checkNewVersion: true
+  sendAnonymousUsage: false
+
+api:
+  dashboard: true
+  insecure: false
+
+entryPoints:
+  web:
+    address: ":80"
+  websecure:
+    address: ":443"
+
+providers:
+  file:
+    directory: "/etc/traefik/conf.d"
+    watch: true
+
+log:
+  level: "INFO"
+  filePath: "/var/log/traefik/traefik.log"
+
+accessLog:
+  filePath: "/var/log/traefik/access.log"
+EOF
+
+    sudo mv "$temp_config" "$config_file"
+    
+    # Создание директории для логов
+    sudo mkdir -p /var/log/traefik
+    
+    # Создание systemd сервиса
+    local service_file=$(mktemp)
+    TEMP_FILES+=("$service_file")
+    
+    cat <<EOF > "$service_file"
+[Unit]
+Description=Traefik
+Documentation=https://doc.traefik.io/traefik/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/traefik --configfile=/etc/traefik/traefik.yml
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    sudo mv "$service_file" "/etc/systemd/system/traefik.service"
+    
+    # Создаем файл для Let's Encrypt сертификатов с правильными правами
+    sudo touch "$CONFIG_DIR/acme.json"
+    sudo chmod 600 "$CONFIG_DIR/acme.json"
+    
+    # Регистрируем и запускаем сервис
+    sudo systemctl daemon-reload
+    sudo systemctl enable traefik
+    sudo systemctl start traefik
+    
+    if systemctl is-active --quiet traefik; then
+        log "INFO" "Traefik успешно установлен и запущен"
+        echo -e "${GREEN}Traefik успешно установлен и запущен.${NC}"
+        echo -e "Версия Traefik: $TRAEFIK_VERSION"
+        echo -e "Конфигурационный файл: $CONFIG_DIR/traefik.yml"
+        echo -e "Динамические конфигурации: $DYNAMIC_CONFIG_DIR/"
+        NATIVE_MODE=true
+    else
+        log "ERROR" "Ошибка запуска Traefik как системного сервиса"
+        echo -e "${RED}Ошибка запуска Traefik!${NC}"
+        return 1
     fi
 }
 
@@ -881,43 +1197,58 @@ update_script() {
 main_menu() {
     while true; do
         echo -e "
-        ${BLUE}=== Управление Traefik v${VERSION} ===${NC}
-        ${GREEN}1) Управление Docker-контейнерами (лейблы)"
+        ${BLUE}=== Управление Traefik v${VERSION} ===${NC}"
         
-        # Добавляем пункты меню только если Kubernetes доступен
+        # Добавляем пункты меню в зависимости от доступности Docker и Kubernetes
+        if [ "$DOCKER_ENABLED" = true ]; then
+            echo -e "${GREEN}        1) Управление Docker-контейнерами (лейблы)"
+        fi
+        
         if [ "$K8S_ENABLED" = true ]; then
             echo -e "        2) Управление Kubernetes (IngressRoute)"
         fi
         
         echo -e "        3) Редактировать основной конфиг (traefik.yml)
         4) Редактировать динамические конфиги (в conf.d/)
-        5) Перезапустить Traefik
-        6) Проверить конфигурацию
-        7) Создать резервную копию конфигураций
-        8) Мониторинг Traefik
-        9) Проверка безопасности
-        10) Установить Traefik"
+        5) Управление статическими конфигурациями
+        6) Перезапустить Traefik
+        7) Проверить конфигурацию
+        8) Создать резервную копию конфигураций
+        9) Мониторинг Traefik
+        10) Проверка безопасности
+        11) Установить Traefik"
         
-        # Дополнительный пункт для включения/отключения Kubernetes
+        # Пункты для включения/отключения компонентов
         if [ "$K8S_ENABLED" = false ]; then
-            echo -e "        11) Включить поддержку Kubernetes"
+            echo -e "        12) Включить поддержку Kubernetes"
         else
-            echo -e "        11) Отключить поддержку Kubernetes"
+            echo -e "        12) Отключить поддержку Kubernetes"
         fi
         
-        echo -e "        12) Обновить этот скрипт
-        13) Выйти${NC}
+        if [ "$DOCKER_ENABLED" = false ]; then
+            echo -e "        13) Включить поддержку Docker"
+        else
+            echo -e "        13) Отключить поддержку Docker"
+        fi
+        
+        echo -e "        14) Обновить этот скрипт
+        15) Выйти${NC}
         "
         read -p "Выберите действие: " choice
 
         case $choice in
-            1) manage_docker_labels ;;
+            1) 
+                if [ "$DOCKER_ENABLED" = true ]; then
+                    manage_docker_labels
+                else
+                    echo -e "${RED}Docker не включен! Выберите пункт 13 для включения.${NC}"
+                fi
+                ;;
             2) 
-                # Проверяем, доступен ли Kubernetes перед выполнением
                 if [ "$K8S_ENABLED" = true ]; then
                     manage_ingress_route
                 else
-                    echo -e "${RED}Kubernetes не включен! Выберите пункт 11 для включения.${NC}"
+                    echo -e "${RED}Kubernetes не включен! Выберите пункт 12 для включения.${NC}"
                 fi
                 ;;
             3) 
@@ -931,12 +1262,20 @@ main_menu() {
                 read -p "Введите имя файла (например, example.yml): " file_name
                 sudo nano "$DYNAMIC_CONFIG_DIR/$file_name"
                 ;;
-            5) 
+            5)
+                log "INFO" "Управление статическими конфигурациями"
+                manage_static_config
+                ;;
+            6) 
                 log "INFO" "Перезапуск Traefik"
                 # Создаем резервную копию перед перезапуском
                 backup_config
                 
-                if docker ps --format '{{.Names}}' | grep -q "$TRAEFIK_CONTAINER_NAME"; then
+                if [ "$NATIVE_MODE" = true ] && systemctl is-active --quiet traefik; then
+                    sudo systemctl restart traefik
+                    log "INFO" "Traefik сервис перезапущен"
+                    echo -e "${GREEN}Traefik сервис перезапущен.${NC}"
+                elif [ "$DOCKER_ENABLED" = true ] && docker ps --format '{{.Names}}' | grep -q "$TRAEFIK_CONTAINER_NAME"; then
                     docker restart "$TRAEFIK_CONTAINER_NAME"
                     log "INFO" "Traefik контейнер перезапущен"
                     echo -e "${GREEN}Traefik контейнер перезапущен.${NC}"
@@ -945,43 +1284,55 @@ main_menu() {
                     log "INFO" "Traefik deployment перезапущен в Kubernetes"
                     echo -e "${GREEN}Traefik deployment перезапущен в Kubernetes.${NC}"
                 else
-                    log "ERROR" "Traefik не найден ни в Docker, ни в Kubernetes"
-                    echo -e "${RED}Traefik не найден ни в Docker, ни в Kubernetes!${NC}"
+                    log "ERROR" "Traefik не найден ни в Docker, ни в Kubernetes, ни как системный сервис"
+                    echo -e "${RED}Traefik не найден ни в Docker, ни в Kubernetes, ни как системный сервис!${NC}"
                 fi
                 ;;
-            6) 
+            7) 
                 log "INFO" "Проверка конфигурации Traefik"
-                if docker ps --format '{{.Names}}' | grep -q "$TRAEFIK_CONTAINER_NAME"; then
+                if [ "$NATIVE_MODE" = true ] && systemctl is-active --quiet traefik; then
+                    /usr/local/bin/traefik version
+                    echo -e "${GREEN}Проверка конфигурации...${NC}"
+                    /usr/local/bin/traefik --configfile="$CONFIG_DIR/traefik.yml" --check
+                elif [ "$DOCKER_ENABLED" = true ] && docker ps --format '{{.Names}}' | grep -q "$TRAEFIK_CONTAINER_NAME"; then
                     docker exec "$TRAEFIK_CONTAINER_NAME" traefik version
                     docker exec "$TRAEFIK_CONTAINER_NAME" traefik healthcheck
                 else
-                    echo -e "${RED}Traefik контейнер не запущен!${NC}"
+                    echo -e "${RED}Traefik не запущен или недоступен!${NC}"
                 fi
                 ;;
-            7) backup_config ;;
-            8) monitor_traefik ;;
-            9) check_security ;;
-            10)
+            8) backup_config ;;
+            9) monitor_traefik ;;
+            10) check_security ;;
+            11)
                 echo -e "
                 ${YELLOW}1) Установить Traefik в Docker
                 2) Установить Traefik в Kubernetes
-                3) Вернуться в меню${NC}
+                3) Установить Traefik нативно (без Docker/Kubernetes)
+                4) Вернуться в меню${NC}
                 "
                 read -p "Выберите действие: " install_choice
                 case $install_choice in
-                    1) install_traefik_docker ;;
+                    1) 
+                        if [ "$DOCKER_ENABLED" = true ]; then
+                            install_traefik_docker
+                        else
+                            echo -e "${RED}Docker не включен! Выберите пункт 13 для включения.${NC}"
+                        fi
+                        ;;
                     2) 
                         if [ "$K8S_ENABLED" = true ]; then
                             install_traefik_k8s
                         else
-                            echo -e "${RED}Kubernetes не включен! Выберите пункт 11 для включения.${NC}"
+                            echo -e "${RED}Kubernetes не включен! Выберите пункт 12 для включения.${NC}"
                         fi
                         ;;
-                    3) ;;
+                    3) install_traefik_native ;;
+                    4) ;;
                     *) echo -e "${RED}Неверный вариант!${NC}" ;;
                 esac
                 ;;
-            11) 
+            12) 
                 if [ "$K8S_ENABLED" = false ]; then
                     log "INFO" "Включение поддержки Kubernetes"
                     echo -e "${YELLOW}Включение поддержки Kubernetes...${NC}"
@@ -1001,8 +1352,31 @@ main_menu() {
                     fi
                 fi
                 ;;
-            12) update_script ;;
-            13) 
+            13)
+                if [ "$DOCKER_ENABLED" = false ]; then
+                    log "INFO" "Включение поддержки Docker"
+                    echo -e "${YELLOW}Включение поддержки Docker...${NC}"
+                    if check_docker || (read -p "Установить Docker? (y/n): " docker_install && 
+                                      [ "$docker_install" = "y" ] && 
+                                      curl -fsSL https://get.docker.com | sh && 
+                                      sudo usermod -aG docker "$USER"); then
+                        DOCKER_ENABLED=true
+                        echo -e "${GREEN}Поддержка Docker включена.${NC}"
+                    else
+                        echo -e "${RED}Не удалось включить поддержку Docker.${NC}"
+                    fi
+                else
+                    log "INFO" "Отключение поддержки Docker"
+                    echo -e "${YELLOW}Отключение поддержки Docker...${NC}"
+                    read -p "Вы точно хотите отключить поддержку Docker? (y/n): " disable_docker
+                    if [ "$disable_docker" = "y" ]; then
+                        DOCKER_ENABLED=false
+                        echo -e "${GREEN}Поддержка Docker отключена.${NC}"
+                    fi
+                fi
+                ;;
+            14) update_script ;;
+            15) 
                 log "INFO" "Завершение работы скрипта"
                 exit 0 
                 ;;
@@ -1013,7 +1387,7 @@ main_menu() {
 
 # --- Точка входа ---
 clear
-echo -e "${BLUE}=== Traefik Management Script v${VERSION} (Kubernetes + Docker) ===${NC}"
+echo -e "${BLUE}=== Traefik Management Script v${VERSION} ===${NC}"
 log "INFO" "Скрипт запущен пользователем $(whoami)"
 
 # Проверка прав
@@ -1026,52 +1400,65 @@ fi
 # Создание директорий для логов и бэкапов
 mkdir -p "$(dirname "$LOG_FILE")" "$BACKUP_DIR" 2>/dev/null || true
 
-# Установка зависимостей и проверка Kubernetes
+# Установка зависимостей и проверка компонентов
 install_dependencies
 
 # Проверка наличия и запуск Traefik при необходимости
-if ! docker ps --format '{{.Names}}' | grep -q "$TRAEFIK_CONTAINER_NAME"; then
-    log "WARNING" "Traefik контейнер не запущен"
-    echo -e "${YELLOW}Traefik контейнер не запущен.${NC}"
-    
-    # Проверяем Kubernetes только если он включен
-    if [ "$K8S_ENABLED" = true ] && ! kubectl get pods -n "$TRAEFIK_NAMESPACE" 2>/dev/null | grep -q "traefik"; then
-        log "WARNING" "Traefik не найден ни в Docker, ни в Kubernetes"
-        echo -e "${RED}Traefik не найден ни в Docker, ни в Kubernetes!${NC}"
-        read -p "Установить Traefik? (y/n): " install_answer
-        if [ "$install_answer" = "y" ]; then
-            echo -e "
-            ${YELLOW}1) Установить в Docker
-            2) Установить в Kubernetes${NC}
-            "
-            read -p "Выберите вариант: " install_option
-            case $install_option in
-                1) install_traefik_docker ;;
-                2) 
-                    if [ "$K8S_ENABLED" = true ]; then
-                        install_traefik_k8s
-                    else
-                        echo -e "${RED}Kubernetes не включен! Установка в Kubernetes невозможна.${NC}"
-                        read -p "Установить в Docker? (y/n): " docker_fallback
-                        if [ "$docker_fallback" = "y" ]; then
-                            install_traefik_docker
-                        fi
-                    fi
-                    ;;
-                *) 
-                    echo -e "${RED}Неверный вариант, продолжение без Traefik.${NC}"
-                    log "WARNING" "Продолжение без установки Traefik"
-                    ;;
-            esac
-        else
-            echo -e "${YELLOW}Продолжение без Traefik. Некоторые функции могут быть недоступны.${NC}"
-            log "WARNING" "Пользователь выбрал продолжение без Traefik"
-        fi
-    elif [ "$K8S_ENABLED" = true ]; then
-        log "INFO" "Traefik запущен в Kubernetes"
-    fi
-else
+if systemctl is-active --quiet traefik; then
+    log "INFO" "Traefik запущен как системный сервис"
+    echo -e "${GREEN}Traefik запущен как системный сервис.${NC}"
+    NATIVE_MODE=true
+elif [ "$DOCKER_ENABLED" = true ] && docker ps --format '{{.Names}}' | grep -q "$TRAEFIK_CONTAINER_NAME"; then
     log "INFO" "Traefik запущен в Docker"
+    echo -e "${GREEN}Traefik запущен в Docker.${NC}"
+elif [ "$K8S_ENABLED" = true ] && kubectl get pods -n "$TRAEFIK_NAMESPACE" 2>/dev/null | grep -q "traefik"; then
+    log "INFO" "Traefik запущен в Kubernetes"
+    echo -e "${GREEN}Traefik запущен в Kubernetes.${NC}"
+else
+    log "WARNING" "Traefik не запущен или не найден"
+    echo -e "${YELLOW}Traefik не запущен или не найден.${NC}"
+    
+    read -p "Установить Traefik? (y/n): " install_answer
+    if [ "$install_answer" = "y" ]; then
+        echo -e "
+        ${YELLOW}1) Установить Traefik в Docker
+        2) Установить Traefik в Kubernetes
+        3) Установить Traefik нативно (без Docker/Kubernetes)${NC}
+        "
+        read -p "Выберите вариант установки: " install_option
+        case $install_option in
+            1) 
+                if [ "$DOCKER_ENABLED" = true ]; then
+                    install_traefik_docker
+                else
+                    echo -e "${RED}Docker не включен! Установка в Docker невозможна.${NC}"
+                    read -p "Установить нативно? (y/n): " native_fallback
+                    if [ "$native_fallback" = "y" ]; then
+                        install_traefik_native
+                    fi
+                fi
+                ;;
+            2) 
+                if [ "$K8S_ENABLED" = true ]; then
+                    install_traefik_k8s
+                else
+                    echo -e "${RED}Kubernetes не включен! Установка в Kubernetes невозможна.${NC}"
+                    read -p "Установить нативно? (y/n): " native_fallback
+                    if [ "$native_fallback" = "y" ]; then
+                        install_traefik_native
+                    fi
+                fi
+                ;;
+            3) install_traefik_native ;;
+            *) 
+                echo -e "${RED}Неверный вариант, продолжение без Traefik.${NC}"
+                log "WARNING" "Продолжение без установки Traefik"
+                ;;
+        esac
+    else
+        echo -e "${YELLOW}Продолжение без Traefik. Некоторые функции могут быть недоступны.${NC}"
+        log "WARNING" "Пользователь выбрал продолжение без Traefik"
+    fi
 fi
 
 main_menu
